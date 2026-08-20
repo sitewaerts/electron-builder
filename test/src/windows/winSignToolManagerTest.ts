@@ -1,11 +1,10 @@
 import { HsmSignManager } from "app-builder-lib/src/codeSign/win/hsmSignManager"
 import { Pkcs11SignManager } from "app-builder-lib/src/codeSign/win/pkcs11SignManager"
-import { SigntoolSignManager } from "app-builder-lib/src/codeSign/win/signtoolBaseSignManager"
+import { publisherNameMatchesCertificate, SigntoolSignManager } from "app-builder-lib/src/codeSign/win/signtoolBaseSignManager"
 import { WindowsSignTaskConfiguration } from "app-builder-lib/src/codeSign/win/signtoolBaseSignManager"
 import { readCertInfoFromX509 } from "app-builder-lib/src/codeSign/certInfo"
 import { WindowsSignAzureManager } from "app-builder-lib/src/codeSign/win/windowsSignAzureManager"
 import { getAtsBundleDir, getDotnetRuntimeDir, getWindowsKitsBundle } from "app-builder-lib/src/toolsets/winCodeSign"
-import { Arch } from "builder-util"
 import { writeFile } from "fs/promises"
 import * as path from "path"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest"
@@ -340,12 +339,14 @@ describe("HSM validation errors", () => {
     expect(() => manager.computeSignToolArgs(config, true)).toThrow(/winCodeSign toolset 1\.x/)
   })
 
-  test("null toolset (legacy default) + HSM → throws toolset error", () => {
+  test("null toolset (modern default) + HSM → succeeds (resolves to newest bundle)", () => {
     const manager = makeHsmManager(undefined)
-    // null toolset behaves as legacy
+    // unset / null toolset now resolves to the newest bundle (modern), so HSM is supported.
     ;(manager as any).packager = { config: { toolsets: {} } }
     const config = makeTaskConfig({ options: hsmOptions })
-    expect(() => manager.computeSignToolArgs(config, true)).toThrow(/winCodeSign toolset 1\.x/)
+    const args = manager.computeSignToolArgs(config, true)
+    expect(args).toContain("/csp")
+    expect(args).toContain("/kc")
   })
 
   test("non-Windows (isWin=false) + HSM → throws Windows-only error", () => {
@@ -693,8 +694,9 @@ describe("WindowsSignAzureManager signFileWithDlib arch selection", { sequential
   const originalArch = process.arch
 
   beforeEach(async () => {
-    vi.mocked(getWindowsKitsBundle).mockImplementation(async ({ arch }) => ({
-      kit: path.resolve("/mock-kits", arch === Arch.ia32 ? "x86" : Arch[arch]),
+    vi.mocked(getWindowsKitsBundle).mockImplementation(async () => ({
+      // Kit tools are always x64 (x86 on 32-bit hosts), never arm64 — x64 runs on arm64 via emulation.
+      kit: path.resolve("/mock-kits", process.arch === "ia32" ? "x86" : "x64"),
       appxAssets: path.resolve("/mock-kits"),
     }))
     vi.mocked(getAtsBundleDir).mockResolvedValue("/mock-ats-bundle")
@@ -708,10 +710,10 @@ describe("WindowsSignAzureManager signFileWithDlib arch selection", { sequential
     vi.mocked(getDotnetRuntimeDir).mockReset()
   })
 
-  function makeAzureManager(tmpDir: string, execSpy: ReturnType<typeof vi.fn>, toVmFile = (f: string) => f): WindowsSignAzureManager {
+  function makeAzureManager(tmpDir: string, execSpy: ReturnType<typeof vi.fn>, toVmFile = (f: string) => f, toolsets: any = { winCodeSign: "1.3.0" }): WindowsSignAzureManager {
     const manager = Object.create(WindowsSignAzureManager.prototype) as WindowsSignAzureManager
     ;(manager as any).packager = {
-      config: { toolsets: { winCodeSign: "1.3.0" } },
+      config: { toolsets },
       getTempFile: (ext: string) => Promise.resolve(path.join(tmpDir, `metadata${ext}`)),
     }
     ;(manager as any).signing = {
@@ -725,14 +727,36 @@ describe("WindowsSignAzureManager signFileWithDlib arch selection", { sequential
     return manager
   }
 
-  async function signedInfo(tmpDir: string, arch: NodeJS.Architecture, toVmFile = (f: string) => f): Promise<{ signtool: string; dlib: string; dotnetRoot: string | undefined }> {
+  async function signedInfo(
+    tmpDir: string,
+    arch: NodeJS.Architecture,
+    toVmFile = (f: string) => f,
+    toolsets: any = { winCodeSign: "1.3.0" }
+  ): Promise<{ signtool: string; dlib: string; dotnetRoot: string | undefined }> {
     Object.defineProperty(process, "arch", { value: arch })
     const exec = vi.fn().mockResolvedValue(undefined)
-    const manager = makeAzureManager(tmpDir, exec, toVmFile)
+    const manager = makeAzureManager(tmpDir, exec, toVmFile, toolsets)
     await manager.signFile({ path: path.join(tmpDir, "app.exe"), options: {} as any })
     const [signtool, args, execOptions] = exec.mock.calls[0]
     const dlib = args[args.indexOf("/dlib") + 1]
     return { signtool, dlib, dotnetRoot: execOptions?.env?.DOTNET_ROOT }
+  }
+
+  // The modern default: an unset / null / "latest" winCodeSign resolves to the newest bundle
+  // (>= 1.3.0), which ships the ATS dlib + .NET payload — so Azure Trusted Signing uses the fast
+  // signtool /dlib path WITHOUT requiring an explicit "1.3.0" pin.
+  for (const [label, toolsets] of [
+    ["toolsets absent", {}],
+    ["winCodeSign null", { winCodeSign: null }],
+    ['winCodeSign "latest"', { winCodeSign: "latest" }],
+  ] as const) {
+    test(`modern default (${label}) activates the dlib path on an x64 host`, async ({ tmpDir }) => {
+      const tmpDirPath = await tmpDir.createTempDir()
+      const { signtool, dlib, dotnetRoot } = await signedInfo(tmpDirPath, "x64", f => f, toolsets)
+      expect(signtool).toBe(path.resolve("/mock-kits", "x64", "signtool.exe"))
+      expect(dlib).toBe(path.resolve("/mock-ats-bundle", "x64", "Azure.CodeSigning.Dlib.dll"))
+      expect(dotnetRoot).toBe(path.resolve("/mock-dotnet-runtime"))
+    })
   }
 
   test("arm64 host falls back to the x64 ats-bundle (no arm64 dlib exists)", async ({ tmpDir }) => {
@@ -741,7 +765,6 @@ describe("WindowsSignAzureManager signFileWithDlib arch selection", { sequential
     expect(signtool).toBe(path.resolve("/mock-kits", "x64", "signtool.exe"))
     expect(dlib).toBe(path.resolve("/mock-ats-bundle", "x64", "Azure.CodeSigning.Dlib.dll"))
     expect(dotnetRoot).toBe(path.resolve("/mock-dotnet-runtime"))
-    expect(vi.mocked(getWindowsKitsBundle)).toHaveBeenCalledWith(expect.objectContaining({ arch: Arch.x64 }))
   })
 
   test("x64 host uses the x64 ats-bundle", async ({ tmpDir }) => {
@@ -758,7 +781,6 @@ describe("WindowsSignAzureManager signFileWithDlib arch selection", { sequential
     expect(signtool).toBe(path.resolve("/mock-kits", "x86", "signtool.exe"))
     expect(dlib).toBe(path.resolve("/mock-ats-bundle", "x86", "Azure.CodeSigning.Dlib.dll"))
     expect(dotnetRoot).toBe(path.resolve("/mock-dotnet-runtime"))
-    expect(vi.mocked(getWindowsKitsBundle)).toHaveBeenCalledWith(expect.objectContaining({ arch: Arch.ia32 }))
   })
 
   test.skipIf(process.platform === "win32")("Wine: DOTNET_ROOT is converted to a Z:\\ path via toVmFile", async ({ tmpDir }) => {
@@ -767,5 +789,118 @@ describe("WindowsSignAzureManager signFileWithDlib arch selection", { sequential
     const tmpDirPath = await tmpDir.createTempDir()
     const { dotnetRoot } = await signedInfo(tmpDirPath, "x64", wineToVmFile)
     expect(dotnetRoot).toBe(path.win32.join("Z:", "/mock-dotnet-runtime"))
+  })
+})
+
+// ─── publisherName ↔ signing certificate validation ──────────────────────────
+
+const acmeCertInfo = {
+  commonName: "Acme Corp",
+  bloodyMicrosoftSubjectDn: "CN=Acme Corp, O=Acme Corporation, L=San Francisco, S=California, C=US",
+}
+
+describe("publisherNameMatchesCertificate", () => {
+  test("plain string matches the certificate CN strictly", () => {
+    expect(publisherNameMatchesCertificate(["Acme Corp"], acmeCertInfo)).toBe(true)
+  })
+
+  test("plain string with a different CN does not match", () => {
+    expect(publisherNameMatchesCertificate(["Evil Corp"], acmeCertInfo)).toBe(false)
+    // strict equality — no substring/case-insensitive matching
+    expect(publisherNameMatchesCertificate(["acme corp"], acmeCertInfo)).toBe(false)
+    expect(publisherNameMatchesCertificate(["Acme"], acmeCertInfo)).toBe(false)
+  })
+
+  test("DN matches when every configured RDN equals the subject's value (subset match)", () => {
+    expect(publisherNameMatchesCertificate(["CN=Acme Corp, O=Acme Corporation"], acmeCertInfo)).toBe(true)
+    // full DN, different RDN order
+    expect(publisherNameMatchesCertificate(["O=Acme Corporation, CN=Acme Corp, C=US, S=California, L=San Francisco"], acmeCertInfo)).toBe(true)
+  })
+
+  test("DN with one mismatched RDN value does not match", () => {
+    expect(publisherNameMatchesCertificate(["CN=Acme Corp, O=Other Org"], acmeCertInfo)).toBe(false)
+  })
+
+  test("DN with an RDN key absent from the subject does not match", () => {
+    expect(publisherNameMatchesCertificate(["CN=Acme Corp, OU=Engineering"], acmeCertInfo)).toBe(false)
+  })
+
+  test("any of multiple configured names matching passes (certificate rotation)", () => {
+    expect(publisherNameMatchesCertificate(["Old Corp Name", "Acme Corp"], acmeCertInfo)).toBe(true)
+    expect(publisherNameMatchesCertificate(["CN=Old Corp, O=Old Org", "CN=Acme Corp, O=Acme Corporation"], acmeCertInfo)).toBe(true)
+  })
+
+  test("no configured name matching fails even with multiple names", () => {
+    expect(publisherNameMatchesCertificate(["Old Corp Name", "Other Corp"], acmeCertInfo)).toBe(false)
+  })
+})
+
+describe("validateExplicitPublisherName", () => {
+  function makeValidationManager(sign: any, certInfo: unknown | null, options: { certInfoRejects?: boolean } = {}) {
+    const manager: any = Object.create(SigntoolSignManager.prototype)
+    manager.platformSpecificBuildOptions = { sign }
+    manager.lazyCertInfo = {
+      value: options.certInfoRejects ? Promise.reject(new Error("cannot read cert")) : Promise.resolve(certInfo),
+    }
+    return manager
+  }
+
+  const validate = (manager: any) => manager.validateExplicitPublisherName()
+
+  test("passes when the configured name matches the certificate CN", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: "Acme Corp" }, acmeCertInfo)
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("passes when a configured DN subset matches the certificate subject", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: "CN=Acme Corp, O=Acme Corporation" }, acmeCertInfo)
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("throws on mismatch, naming both the configured value and the certificate subject", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: "Evil Corp" }, acmeCertInfo)
+    await expect(validate(manager)).rejects.toThrow(/Evil Corp/)
+    await expect(validate(manager)).rejects.toThrow(/CN=Acme Corp, O=Acme Corporation, L=San Francisco, S=California, C=US/)
+    await expect(validate(manager)).rejects.toThrow(/wrong certificate/)
+  })
+
+  test("passes when any of multiple configured names matches (certificate rotation)", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: ["Old Corp Name", "Acme Corp"] }, acmeCertInfo)
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("throws when none of multiple configured names matches", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: ["Old Corp Name", "Other Corp"] }, acmeCertInfo)
+    await expect(validate(manager)).rejects.toThrow(/Old Corp Name \| Other Corp/)
+  })
+
+  test("skips when certificate info is unavailable (null)", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: "Evil Corp" }, null)
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("skips when certificate info cannot be read (rejects)", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: "Evil Corp" }, null, { certInfoRejects: true })
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("skips when a custom sign hook is configured (actual signing certificate unknown)", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: "Evil Corp", sign: "./my-sign-hook.js" }, acmeCertInfo)
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("skips when publisherName is not configured (auto-derive path)", async () => {
+    const manager = makeValidationManager({ type: "signtool" }, acmeCertInfo)
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("skips on explicit publisherName: null opt-out", async () => {
+    const manager = makeValidationManager({ type: "signtool", publisherName: null }, acmeCertInfo)
+    await expect(validate(manager)).resolves.toBeUndefined()
+  })
+
+  test("skips for azure signing config (no local certificate)", async () => {
+    const manager = makeValidationManager({ type: "azure", publisherName: "Evil Corp" }, acmeCertInfo)
+    await expect(validate(manager)).resolves.toBeUndefined()
   })
 })

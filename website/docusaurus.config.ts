@@ -157,6 +157,11 @@ const config: Config = {
             },
             {
               type: "doc",
+              docId: "tutorials/offline-air-gapped-builds",
+              label: "Offline / Air-Gapped Builds",
+            },
+            {
+              type: "doc",
               docId: "tutorials/release-using-channels",
               label: "Release Using Channels",
             },
@@ -167,6 +172,13 @@ const config: Config = {
             },
             { type: "doc", docId: "troubleshooting", label: "Troubleshooting" },
           ],
+        },
+
+        {
+          type: "doc",
+          docId: "migration/v27-breaking-changes",
+          position: "left",
+          label: "v27 Breaking Changes",
         },
 
         {

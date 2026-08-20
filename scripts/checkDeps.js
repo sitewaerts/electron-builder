@@ -16,6 +16,10 @@ const knownUnusedDevDependencies = new Set([
   // Used in test/vitest-scripts/ (test dir is ignored by depcheck) or via pnpm workspace scripts
   "vitest",
   "tsx",
+  // Used at runtime by the `vitest --merge-reports` CLI in the merge-smart-cache job (HTML reporter +
+  // coverage provider), not statically imported, so depcheck can't see them.
+  "@vitest/ui",
+  "@vitest/coverage-v8",
 ])
 const knownMissedDependencies = new Set(["babel-core", "babel-preset-env", "babel-preset-stage-0", "babel-preset-react"])
 
@@ -74,7 +78,8 @@ const toml = result.missing.toml
     if (
       name === "electron-builder-squirrel-windows" ||
       name === "electron-webpack" ||
-      (packageName === "app-builder-lib" && (name === "dmg-builder" || knownMissedDependencies.has(name) || name.startsWith("@babel/")))
+      // electron-updater is resolved from the user's projectDir at runtime (require.resolve with paths), not a package dependency
+      (packageName === "app-builder-lib" && (name === "dmg-builder" || name === "electron-updater" || knownMissedDependencies.has(name) || name.startsWith("@babel/")))
     ) {
       delete result.missing[name]
     }

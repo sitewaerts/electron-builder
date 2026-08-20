@@ -1787,6 +1787,17 @@ exports[`snapcraft > core24 Multipass real build > core24 useMultipass full buil
 }
 `;
 
+exports[`snapcraft > core24 classic confinement omits plugs and layout 1`] = `
+{
+  "linux": [
+    {
+      "arch": "x64",
+      "file": "cl-co-app_1.1.0_amd64.snap",
+    },
+  ],
+}
+`;
+
 exports[`snapcraft > core24 command always points at the launcher script and keeps it at the snap root 1`] = `
 {
   "linux": [
@@ -2086,6 +2097,17 @@ exports[`snapcraft > core24 no gnome extension 2`] = `
 `;
 
 exports[`snapcraft > core24 remoteBuild build mode 1`] = `
+{
+  "linux": [
+    {
+      "arch": "x64",
+      "file": "TestApp_1.1.0_amd64.snap",
+    },
+  ],
+}
+`;
+
+exports[`snapcraft > core24 remoteBuild: buildFor array is forwarded correctly 1`] = `
 {
   "linux": [
     {

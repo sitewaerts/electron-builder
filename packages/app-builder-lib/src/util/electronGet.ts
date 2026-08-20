@@ -9,7 +9,7 @@ import {
   MirrorOptions,
 } from "@electron/get"
 import { exec, exists, log, PADDING, parseValidEnvVarUrl, sanitizeDirPath, to7zaOutputSwitch, ensureDir, moveDirAtomic } from "builder-util"
-import { HttpError, retry, sleep } from "builder-util-runtime"
+import { HttpError, MemoLazy, retry, sleep } from "builder-util-runtime"
 import * as crypto from "crypto"
 import type { ProgressBar } from "electron-publish"
 import { MultiProgress } from "electron-publish"
@@ -52,7 +52,7 @@ export type ArtifactDownloadOptions = {
   cacheDir?: string
 }
 
-function hashUrlSafe(input: string, length = 6): string {
+export function hashUrlSafe(input: string, length = 6): string {
   let hash = 5381
   for (let i = 0; i < input.length; i++) {
     hash = ((hash << 5) + hash) ^ input.charCodeAt(i)
@@ -62,11 +62,27 @@ function hashUrlSafe(input: string, length = 6): string {
   return out.length >= length ? out.slice(0, length) : out.padStart(length, "0")
 }
 
-export function getCacheDirectory(options: { isAvoidSystemOnWindows?: boolean; allowEnvVarOverride: boolean }): string {
+// MemoLazy (not Lazy): keyed on ELECTRON_BUILDER_CACHE so the resolved cache dir is recomputed if the
+// override env var changes, while staying memoized when it doesn't (the production case). The creator
+// also ensures the resolved dir exists — that side effect lives here, at the point of use, so
+// getCacheDirectoryInternal stays a pure path resolver.
+export const cacheDirectoryOverrideAllowed = new MemoLazy<string | undefined, string>(
+  () => process.env.ELECTRON_BUILDER_CACHE?.trim(),
+  async () => {
+    const dir = await getCacheDirectoryInternal({ isAvoidSystemOnWindows: true, allowEnvVarOverride: true })
+    await ensureDir(dir)
+    return dir
+  }
+)
+// Exposed for testing; not intended for public use. Pure path resolution (no I/O) — use the memoized
+// const's above when you need the directory to exist on disk. Kept async for a stable Promise-returning
+// contract across all call sites.
+// eslint-disable-next-line @typescript-eslint/require-await
+export async function getCacheDirectoryInternal(options: { isAvoidSystemOnWindows?: boolean; allowEnvVarOverride: boolean }): Promise<string> {
   const { isAvoidSystemOnWindows = true, allowEnvVarOverride } = options
   const env = process.env.ELECTRON_BUILDER_CACHE?.trim()
   if (allowEnvVarOverride && env && path.parse(env).root) {
-    return env
+    return sanitizeDirPath(env)
   }
 
   const appName = "electron-builder"
@@ -169,7 +185,9 @@ async function extractZipStreaming(file: string, dir: string): Promise<void> {
   }
 }
 
-export async function extractArchive(file: string, dir: string) {
+export async function extractArchive(archive: string, dir: string) {
+  const file = sanitizeDirPath(archive)
+
   const tmpDir = `${dir}.tmp`
   await fs.mkdir(tmpDir, { recursive: true })
 
@@ -197,21 +215,24 @@ export async function extractArchive(file: string, dir: string) {
 
     if (file.endsWith(".tar.gz") || file.endsWith(".tgz")) {
       await tar.extract({ file, cwd: tmpDir, strip: 1 })
-    } else if (file.endsWith(".tar.xz") || file.endsWith(".txz")) {
-      // node-tar cannot decompress xz, so use 7za to turn the .tar.xz into a .tar, then extract that tar.
+    } else if (file.endsWith(".tar.xz") || file.endsWith(".txz") || file.endsWith(".tar.7z")) {
+      // Compressed tarballs node-tar cannot decompress itself (xz, 7z): use 7za to strip the outer
+      // compression layer into a .tar, then extract that tar.
+      // Note: the .tar.7z check MUST stay ahead of the plain .7z branch below, otherwise only the outer
+      // 7z layer is removed and the inner tar is left behind as-is (see https://github.com/electron-userland/electron-builder/issues/10002).
       const cmd7za = await getPath7za()
-      const xzOutDir = `${tmpDir}.xz`
-      await fs.rm(xzOutDir, { recursive: true, force: true })
-      await fs.mkdir(xzOutDir, { recursive: true })
+      const decompressOutDir = `${tmpDir}.decompress`
+      await fs.rm(decompressOutDir, { recursive: true, force: true })
+      await fs.mkdir(decompressOutDir, { recursive: true })
       try {
-        await exec(cmd7za, ["x", "-bd", file, to7zaOutputSwitch(sanitizeDirPath(xzOutDir)), "-y"])
-        const innerTar = (await fs.readdir(xzOutDir)).find(f => f.endsWith(".tar"))
+        await exec(cmd7za, ["x", "-bd", file, to7zaOutputSwitch(sanitizeDirPath(decompressOutDir)), "-y"])
+        const innerTar = (await fs.readdir(decompressOutDir)).find(f => f.endsWith(".tar"))
         if (innerTar == null) {
-          throw new Error(`xz decompression of ${path.basename(file)} produced no .tar archive`)
+          throw new Error(`decompression of ${path.basename(file)} produced no .tar archive`)
         }
-        await tar.extract({ file: path.join(xzOutDir, innerTar), cwd: tmpDir, strip: 1 })
+        await tar.extract({ file: path.join(decompressOutDir, innerTar), cwd: tmpDir, strip: 1 })
       } finally {
-        await fs.rm(xzOutDir, { recursive: true, force: true })
+        await fs.rm(decompressOutDir, { recursive: true, force: true })
       }
     } else if (file.endsWith(".zip")) {
       await extractZipStreaming(file, tmpDir)
@@ -359,6 +380,12 @@ async function downloadArtifactToFile(config: ElectronArtifactDetails, label: st
  * Checks electron-builder's own archive cache for a previously downloaded archive.
  * Validates the SHA-256 checksum when one is known. Returns the cached path on hit,
  * null on miss or checksum mismatch (mismatch also deletes the stale file).
+ *
+ * Air-gapped seeding contract: placing the archive at
+ * `<cacheDir>/<releaseName>/<archive>` (e.g. `$ELECTRON_BUILDER_CACHE/appimage@1.0.3/appimage-tools-runtime-20251108.tar.gz`)
+ * is sufficient for a fully offline toolset resolution — the checksum here is computed locally
+ * against the value hardcoded in the toolset module, and extraction happens locally too. No
+ * `.state` file needs to be seeded. See https://www.electron.build/tutorials/offline-air-gapped-builds.
  */
 async function resolveFromArchiveCache(archiveCachePath: string, label: string, expectedSha256: string | undefined): Promise<string | null> {
   if (!(await exists(archiveCachePath))) {
@@ -511,7 +538,7 @@ export async function download(url: string, output: string, checksum?: string | 
     {
       version: "9.9.9",
       artifactName: filenameWithExt,
-      cacheRoot: path.resolve(getCacheDirectory({ allowEnvVarOverride: true }), "downloads"),
+      cacheRoot: path.resolve(await cacheDirectoryOverrideAllowed.value, "downloads"),
       cacheMode: resolveCacheMode(),
       ...(checksum != null ? { checksums: { [filenameWithExt]: checksum } } : { unsafelyDisableChecksums: true }),
       mirrorOptions: { resolveAssetURL: async () => Promise.resolve(url) },
@@ -582,9 +609,12 @@ export async function downloadBuilderToolset(options: {
   const baseUrl = getBinariesMirrorUrl(githubOrgRepo)
   const fullUrl = resolveBuilderBinaryUrl(releaseName, filenameWithExt, baseUrl, overrideUrl)
   const suffix = hashUrlSafe(fullUrl, 5)
-  const folderName = `${filenameWithExt.replace(/\.(tar\.gz|tgz|tar\.xz|txz|zip|7z)$/, "")}-${suffix}`
+  // tar.7z is listed before 7z so the full extension is stripped. Deliberate side effect: this changes the
+  // extract-dir name for .tar.7z toolsets (e.g. the snap template) from "<name>.tar-<hash>" to "<name>-<hash>",
+  // which busts caches poisoned by the broken .tar.7z extraction in 26.15.0-26.15.6 (issue #10002).
+  const folderName = `${filenameWithExt.replace(/\.(tar\.gz|tgz|tar\.xz|txz|tar\.7z|zip|7z)$/, "")}-${suffix}`
   // releaseName is library input; enforce cache-dir containment (rejects traversal, clears taint into shell extraction)
-  const cacheDir = getCacheDirectory({ allowEnvVarOverride: true })
+  const cacheDir = await cacheDirectoryOverrideAllowed.value
   const extractDir = sanitizeDirPath(path.join(cacheDir, releaseName, folderName), cacheDir)
 
   // Use resolveAssetURL so @electron/get's ELECTRON_MIRROR env var check cannot override
@@ -601,7 +631,7 @@ export async function downloadBuilderToolset(options: {
   const config: ElectronDownloadRequest & ElectronDownloadRequestOptions & { isGeneric: true } = {
     version: "9.9.9", // must be >1.3.2 to bypass @electron/get validation shortcut
     artifactName: filenameWithExt,
-    cacheRoot: path.resolve(getCacheDirectory({ allowEnvVarOverride: true }), "downloads"),
+    cacheRoot: path.resolve(await cacheDirectoryOverrideAllowed.value, "downloads"),
     cacheMode: resolveCacheMode(),
     ...(checksums != null ? { checksums } : { unsafelyDisableChecksums: true }),
     mirrorOptions,
@@ -611,20 +641,111 @@ export async function downloadBuilderToolset(options: {
 }
 
 /**
- * Downloads and extracts an electron platform artifact (e.g. ffmpeg) using @electron/get.
- * Deduplicates concurrent calls for the same artifact within the same process.
+ * Mirrors @electron/get's default cache root (`env-paths("electron", { suffix: "" }).cache`).
+ * @electron/get does not export it and its package `exports` map blocks deep imports, so the
+ * (deliberately tiny) platform switch is replicated here. Must stay in sync with the
+ * `cacheRoot` default documented in @electron/get's `ElectronDownloadRequestOptions`.
+ * @internal exported for unit testing
  */
-function buildElectronArtifactConfig(artifactOptions: ArtifactDownloadOptions): ElectronPlatformArtifactDetails {
+export function defaultElectronGetCacheRoot(): string {
+  const name = "electron"
+  const homeDir = os.homedir()
+  switch (os.platform()) {
+    case "darwin":
+      return path.join(homeDir, "Library", "Caches", name)
+    case "win32":
+      return path.join(process.env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local"), name, "Cache")
+    default:
+      return path.join(process.env.XDG_CACHE_HOME || path.join(homeDir, ".cache"), name)
+  }
+}
+
+/**
+ * Parses the upstream `SHASUMS256.txt` format into the `Record<filename, sha256-hex>` shape that
+ * @electron/get accepts as inline `checksums`. Each line is `<sha256-hex> *<filename>` (binary
+ * mode) or `<sha256-hex>  <filename>` (text mode); malformed lines are ignored.
+ * @internal exported for unit testing
+ */
+export function parseChecksumFile(content: string): Record<string, string> {
+  const checksums: Record<string, string> = {}
+  for (const rawLine of content.split("\n")) {
+    const match = /^([a-fA-F0-9]{64})\s+\*?(.+)$/.exec(rawLine.trim())
+    if (match != null) {
+      checksums[match[2]] = match[1].toLowerCase()
+    }
+  }
+  return checksums
+}
+
+/**
+ * Looks for a locally seeded SHASUMS256 file at the root of the @electron/get cache and returns
+ * its contents as inline `checksums`, or null when nothing usable is seeded.
+ *
+ * Why: without inline `checksums`, @electron/get re-downloads `SHASUMS256.txt` with a hardcoded
+ * `cacheMode: Bypass` on EVERY build — even when the artifact itself is a cache hit — so a fully
+ * seeded cache still requires network access and air-gapped builds fail (#10039). Cache-seeding
+ * tools (e.g. flatpak-node-generator) already place `SHASUMS256.txt-<version>` flat at the cache
+ * root; feeding it back as inline `checksums` keeps checksum validation enabled while making it
+ * fully offline. A plain `SHASUMS256.txt` at the cache root is accepted as a manual-seeding
+ * fallback. A candidate file is only used when it actually contains an entry for the requested
+ * artifact, so a stale file for another version can never break an online build.
+ * See https://www.electron.build/tutorials/offline-air-gapped-builds for the seeding contract.
+ * @internal exported for unit testing
+ */
+export async function resolveSeededChecksums(cacheRoot: string, version: string, artifactFileName: string): Promise<Record<string, string> | null> {
+  const candidates = [path.join(cacheRoot, `SHASUMS256.txt-${version}`), path.join(cacheRoot, "SHASUMS256.txt")]
+  for (const candidate of candidates) {
+    if (!(await exists(candidate))) {
+      continue
+    }
+    let content: string
+    try {
+      content = await fs.readFile(candidate, "utf-8")
+    } catch (err: any) {
+      log.warn({ file: log.filePath(candidate), err: err.message }, "failed to read seeded SHASUMS file — ignoring it")
+      continue
+    }
+    const checksums = parseChecksumFile(content)
+    if (checksums[artifactFileName] == null) {
+      log.warn({ file: log.filePath(candidate), artifactFileName }, "seeded SHASUMS file has no entry for the requested artifact — ignoring it")
+      continue
+    }
+    log.debug({ file: log.filePath(candidate), artifactFileName }, "using locally seeded SHASUMS256 checksums — checksum validation can run offline")
+    return checksums
+  }
+  return null
+}
+
+/**
+ * Assembles the `@electron/get` artifact config (`ElectronPlatformArtifactDetails`) from
+ * `ArtifactDownloadOptions`: spreads the caller's options and pins `cacheRoot`/`platform`/`arch`/
+ * `version`/`artifactName` and the resolved cache mode, warning when checksum verification is
+ * disabled. When the caller provides no `checksums` (user-provided `electronGet.checksums` always
+ * wins) and verification is not disabled, a locally seeded `SHASUMS256.txt-<version>` at the cache
+ * root is picked up as inline `checksums` so validation works offline (see resolveSeededChecksums).
+ * Callers pass the result to `downloadArtifactToFile` / `downloadAndExtract`.
+ * @internal exported for unit testing
+ */
+export async function buildElectronArtifactConfig(artifactOptions: ArtifactDownloadOptions): Promise<ElectronPlatformArtifactDetails> {
   const { options, arch, version, platformName: platform, artifactName, cacheDir: cacheRoot } = artifactOptions
 
   if (options?.unsafelyDisableChecksums) {
     log.warn(
       { artifactName },
-      "electronGet.unsafelyDisableChecksums is enabled — downloaded artifacts will NOT be verified.txt; a compromised mirror can serve malicious binaries undetected"
+      "electronGet.unsafelyDisableChecksums is enabled — downloaded artifacts will NOT be verified; a compromised mirror can serve malicious binaries undetected"
     )
   }
 
   const artifactConfig: ElectronPlatformArtifactDetails = { ...options, cacheRoot, platform, arch, version, artifactName, cacheMode: resolveCacheMode() }
+  if (artifactConfig.checksums == null && !artifactConfig.unsafelyDisableChecksums) {
+    // Matches @electron/get's getArtifactFileName for non-generic artifacts; `artifactSuffix` and
+    // `customFilename` cannot diverge here — both are excluded from ElectronGetOptions.
+    const artifactFileName = `${artifactName}-v${version}-${platform}-${arch}.zip`
+    const seededChecksums = await resolveSeededChecksums(cacheRoot ?? defaultElectronGetCacheRoot(), version, artifactFileName)
+    if (seededChecksums != null) {
+      artifactConfig.checksums = seededChecksums
+    }
+  }
   return artifactConfig
 }
 
@@ -632,18 +753,23 @@ function buildElectronArtifactConfig(artifactOptions: ArtifactDownloadOptions): 
  * Downloads the electron artifact zip via @electron/get (with caching) and returns the zip file path.
  * Use when you need to extract the zip yourself (e.g. directly to appOutDir to preserve empty dirs and symlinks).
  */
-export function downloadElectronArtifactZip(options: ArtifactDownloadOptions): Promise<string> {
-  const config = buildElectronArtifactConfig(options)
+export async function downloadElectronArtifactZip(options: ArtifactDownloadOptions): Promise<string> {
+  const config = await buildElectronArtifactConfig(options)
   return downloadArtifactToFile(config, config.artifactName)
 }
 
+/**
+ * Downloads an electron platform artifact (e.g. ffmpeg) via `@electron/get` and extracts it into a
+ * content-addressed cache directory (keyed on a hash of the resolved artifact config), returning the
+ * extraction path.
+ */
 export async function downloadElectronArtifact(options: ArtifactDownloadOptions): Promise<string> {
   const { arch, version, platformName: platform, artifactName } = options
-  const artifactConfig = buildElectronArtifactConfig(options)
+  const artifactConfig = await buildElectronArtifactConfig(options)
 
   const suffix = hashUrlSafe(JSON.stringify(artifactConfig), 5)
   const folderName = `${artifactName}-v${version}-${platform}-${arch}-${suffix}`
-  const extractDir = path.join(getCacheDirectory({ allowEnvVarOverride: true }), `${artifactName}-v${version}`, folderName)
+  const extractDir = path.join(await cacheDirectoryOverrideAllowed.value, `${artifactName}-v${version}`, folderName)
 
   return downloadAndExtract(artifactConfig, extractDir, artifactName)
 }

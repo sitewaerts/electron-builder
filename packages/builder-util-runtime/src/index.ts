@@ -1,6 +1,7 @@
 export { BlockMap } from "./blockMapApi.js"
 export { CancellationError, CancellationToken } from "./CancellationToken.js"
 export { newError } from "./error.js"
+export { hashFile } from "./hash.js"
 export {
   configureRequestOptions,
   configureRequestOptionsFromUrl,
@@ -26,6 +27,7 @@ export {
   CustomPublishOptions,
   GenericServerOptions,
   getS3LikeProviderBaseUrl,
+  getGitlabAuthHeaders,
   GithubOptions,
   githubUrl,
   githubTagPrefix,
@@ -35,6 +37,7 @@ export {
   PublishProvider,
   S3Options,
   SnapStoreOptions,
+  R2Options,
   SpacesOptions,
   GitlabReleaseInfo,
   GitlabReleaseAsset,

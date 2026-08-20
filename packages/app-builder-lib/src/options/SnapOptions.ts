@@ -44,16 +44,14 @@ export interface SnapcraftOptions extends TargetSpecificOptions {
   readonly core22?: SnapOptionsLegacy | null
 
   /**
-   * **[Beta]** Options for building a core24 snap. Uses the snapcraft CLI directly.
+   * Options for building a core24 snap. Uses the snapcraft CLI directly.
    * Inherits desktop-entry fields from `CommonLinuxOptions` and publish config from `TargetSpecificOptions`.
-   * @beta
    */
   readonly core24?: SnapOptions24 | null
   /**
-   * **[Beta]** Pass-through custom snap configuration. electron-builder will read the
+   * Pass-through custom snap configuration. electron-builder will read the
    * snapcraft.yaml at `yamlPath` and use it verbatim — no plugs, extensions,
    * organize mappings, or desktop files are injected.
-   * @beta
    */
   readonly custom?: SnapOptionsCustom | null
 }
@@ -230,9 +228,11 @@ export interface SnapOptionsLegacy extends CommonLinuxOptions, TargetSpecificOpt
  * Configuration for a remote snap build on [Launchpad](https://launchpad.net/).
  * Remote builds run on Canonical's infrastructure without requiring native hardware or nested virtualisation.
  *
- * Each electron-builder build invocation targets exactly one architecture — to build for multiple
- * architectures, configure the top-level `arch` option (e.g. `arch: ["x64", "arm64"]`); each arch
- * spawns a separate `snapcraft remote-build` job on Launchpad.
+ * A single remote build can target one or more architectures. Set `buildFor` to a string for one
+ * arch, or to an array (e.g. `["amd64", "arm64"]`) to build several architectures in a single
+ * `snapcraft remote-build` job on Launchpad that emits a separate snap artifact per arch.
+ * Alternatively, the top-level `arch` option (e.g. `arch: ["x64", "arm64"]`) spawns a separate
+ * remote-build job per architecture — do not combine that with a `buildFor` array (mutually exclusive).
  *
  * Authentication is resolved in this order:
  * 1. `cscLink` config field — base64-encoded credentials or a file path
@@ -261,15 +261,21 @@ export interface RemoteBuildOptions {
   launchpadUsername?: string
 
   /**
-   * Target architecture for the remote build. Accepts a single snapcraft arch string
-   * (e.g. `"amd64"`, `"arm64"`, `"armhf"`).
+   * Target architecture (or architectures) for the remote build.
    *
-   * To build for multiple architectures, configure electron-builder's top-level `arch` option
-   * (e.g. `arch: ["x64", "arm64"]`) — each arch spawns a separate remote-build job on Launchpad,
-   * keeping the one-build-per-artifact contract intact.
+   * - **Single string** (e.g. `"amd64"`): one Launchpad job, one output snap.
+   * - **Array** (e.g. `["amd64", "arm64"]`): one Launchpad job that builds all listed
+   *   architectures and downloads each resulting snap. All produced snaps are emitted as
+   *   separate build artifacts.
+   *
+   * Using an array here is mutually exclusive with setting `arch: ["x64", "arm64"]` at the
+   * electron-builder top level — the top-level `arch` option spawns a separate remote-build
+   * job per architecture, which would duplicate work.
+   *
    * @example "amd64"
+   * @example ["amd64", "arm64"]
    */
-  buildFor?: string
+  buildFor?: string | string[]
 
   /**
    * Suppress the Launchpad public-upload consent prompt by automatically accepting it.
@@ -306,15 +312,13 @@ export interface RemoteBuildOptions {
 }
 
 /**
- * **[Beta]** Options for building a core24 snap. This interface does not extend the legacy
+ * Options for building a core24 snap. This interface does not extend the legacy
  * `SnapBaseOptions` — it uses the snapcraft CLI directly.
  *
  * Fields inherited from {@link CommonLinuxOptions} (`description`, `category`, `mimeTypes`,
  * `executableArgs`, `desktop`, `synopsis`) are automatically populated from the root `linux.*`
  * configuration. You do not need to duplicate them here; values set directly on this interface
  * take precedence over the cascaded `linux.*` values.
- *
- * @beta
  */
 export interface SnapOptions24 extends CommonLinuxOptions, TargetSpecificOptions {
   // ─── Build environment (mutually exclusive) ─────────────────────────────────
@@ -354,7 +358,9 @@ export interface SnapOptions24 extends CommonLinuxOptions, TargetSpecificOptions
   /**
    * Configuration for a remote build on [Launchpad](https://launchpad.net/).
    * Enables cross-architecture builds in CI without native hardware or nested virtualisation.
-   * Each build invocation targets one arch; use `arch: ["x64", "arm64"]` to build for multiple.
+   * Set `remoteBuild.buildFor: ["amd64", "arm64"]` to build several architectures in one Launchpad
+   * job, or the top-level `arch: ["x64", "arm64"]` option to spawn a separate job per architecture
+   * (the two are mutually exclusive).
    */
   readonly remoteBuild?: RemoteBuildOptions | null
 

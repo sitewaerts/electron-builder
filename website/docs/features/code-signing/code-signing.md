@@ -39,11 +39,13 @@ All Apple certificates require membership in the [Apple Developer Program](https
 
 | Certificate Type | Trust | CI/CD Compatible | Notes |
 |---|---|---|---|
-| Standard OV Certificate | After reputation builds (days-weeks) | Yes (exportable) | Most common choice |
-| EV (Extended Validation) Certificate | Immediate | No (hardware dongle) | Best for fast trust; cannot be used in most CI |
+| Standard OV Certificate | After reputation builds (days-weeks) | Yes (exportable `.pfx`) | Most common choice |
+| EV (Extended Validation) Certificate | Immediate | Yes, via a hardware-token method | Key bound to a hardware dongle/HSM; not exportable to a file |
 | Azure Trusted Signing | Immediate | Yes | Microsoft's cloud signing service; see [code-signing-win.md](code-signing-win.md) |
 
 For Windows, purchase from any major CA (DigiCert, Sectigo, SSL.com). See [Get a Code Signing Certificate](https://msdn.microsoft.com/windows/hardware/drivers/dashboard/get-a-code-signing-certificate) (select "Microsoft Authenticode" platform).
+
+electron-builder picks the signing backend from the `type` field of `win.sign`: a certificate file or the Windows store (`signtool`, the default), a hardware token (`hsm` on Windows, `pkcs11` on macOS/Linux), or cloud signing (`azure`). An EV or other non-exportable key works in CI through the `hsm`, `pkcs11`, or `azure` methods. See [Windows Code Signing](code-signing-win.md) for full configuration.
 
 :::note[Gatekeeper and Apple certificates]
 macOS Gatekeeper only recognizes [Apple-issued certificates](https://developer.apple.com/support/code-signing/). Third-party certificates cannot be used to sign macOS apps for Gatekeeper.
@@ -89,7 +91,7 @@ When cross-compiling Windows on macOS, use `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSW
 | `AZURE_CLIENT_ID` | Application (Client) ID of your App registration |
 | `AZURE_CLIENT_SECRET` | Secret value for your App registration |
 
-See [Windows Code Signing](code-signing-win.md#using-azure-trusted-signing) for full Azure Trusted Signing setup.
+See [Windows Code Signing](code-signing-win.md#azure-trusted-signing-type-azure-beta) for full Azure Trusted Signing setup.
 
 ## Encoding a Certificate for CI
 

@@ -24,13 +24,16 @@ import {
   PublishContext,
   Publisher,
   PublishOptions,
+  R2Publisher,
   S3Publisher,
   SnapStorePublisher,
   SpacesPublisher,
   UploadTask,
 } from "electron-publish"
 import { MultiProgress } from "electron-publish/internal"
-import { readFile, writeFile } from "fs/promises"
+import { readFile } from "fs/promises"
+import _fsExtra from "fs-extra"
+const { outputFile } = _fsExtra
 import * as path from "path"
 import { WriteStream as TtyWriteStream } from "tty"
 import { AppInfo } from "../appInfo.js"
@@ -65,7 +68,7 @@ function checkOptions(publishPolicy: any) {
 }
 
 export class PublishManager implements PublishContext {
-  private readonly nameToPublisher = new Map<string, Publisher | null>()
+  private readonly nameToPublisher = new Map<string, Promise<Publisher | null>>()
 
   private readonly taskManager: AsyncTaskManager
 
@@ -115,7 +118,7 @@ export class PublishManager implements PublishContext {
 
       const publishConfig = await getAppUpdatePublishConfiguration(packager, null, event.arch, this.isPublish)
       if (publishConfig != null) {
-        await writeFile(path.join(packager.getResourcesDir(event.appOutDir), "app-update.yml"), serializeToYaml(publishConfig))
+        await writeAppUpdateYaml(packager.getResourcesDir(event.appOutDir), publishConfig)
       }
     })
 
@@ -211,14 +214,21 @@ export class PublishManager implements PublishContext {
     }
   }
 
-  private async getOrCreatePublisher(publishConfig: PublishConfiguration, appInfo: AppInfo): Promise<Publisher | null> {
+  private getOrCreatePublisher(publishConfig: PublishConfiguration, appInfo: AppInfo): Promise<Publisher | null> {
     // to not include token into cache key
     const providerCacheKey = safeStringifyJson(publishConfig)
     let publisher = this.nameToPublisher.get(providerCacheKey)
     if (publisher == null) {
-      publisher = await createPublisher(this, appInfo.version, publishConfig, this.publishOptions, this.packager)
+      publisher = createPublisher(this, appInfo.version, publishConfig, this.publishOptions, this.packager).then(it => {
+        if (it != null) {
+          log.info({ publisher: it.toString() }, "publishing")
+        }
+        return it
+      })
+      // cache the pending promise synchronously — concurrent scheduleUpload calls must share one publisher (and thus one release) instead of racing to create duplicates
       this.nameToPublisher.set(providerCacheKey, publisher)
-      log.info({ publisher: publisher!.toString() }, "publishing")
+      // on failure, evict so that a subsequent call can retry (the rejection still propagates to the caller)
+      publisher.catch(() => this.nameToPublisher.delete(providerCacheKey))
     }
     return publisher
   }
@@ -266,6 +276,10 @@ export async function getAppUpdatePublishConfiguration(
     }
   }
   return publishConfig
+}
+
+export async function writeAppUpdateYaml(resourcesDir: string, publishConfig: PublishConfiguration): Promise<void> {
+  await outputFile(path.join(resourcesDir, "app-update.yml"), serializeToYaml(publishConfig))
 }
 
 export async function getPublishConfigsForUpdateInfo(
@@ -377,6 +391,9 @@ async function requireProviderClass(provider: string, packager: { buildResources
 
     case "spaces":
       return SpacesPublisher
+
+    case "r2":
+      return R2Publisher
 
     case "bitbucket":
       return BitbucketPublisher

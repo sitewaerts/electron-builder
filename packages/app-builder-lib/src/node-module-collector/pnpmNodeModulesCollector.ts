@@ -1,7 +1,7 @@
 import _fsExtra from "fs-extra"
 import { Lazy } from "lazy-val"
 import * as path from "path"
-import { LogMessageByKey, type Package } from "./moduleManager.js"
+import { LogMessageByKey, type Package, readJsonOrNull } from "./moduleManager.js"
 import { NodeModulesCollector } from "./nodeModulesCollector.js"
 import { getPackageManagerCommand, PM } from "./packageManager.js"
 import type { PackageJson, PnpmDependency } from "./types.js"
@@ -197,7 +197,7 @@ export class PnpmNodeModulesCollector extends NodeModulesCollector<PnpmDependenc
     // the name-based lookup above returns null. Reading directly from tree.path ensures that
     // link: dependencies — which some pnpm versions omit from `pnpm list --prod` output —
     // still appear in `all` and therefore reach the production graph.
-    const packageJson = locatedJson ?? (tree.path ? ((await _fsExtra.readJson(path.join(tree.path, "package.json")).catch(() => null)) as PackageJson | null) : null)
+    const packageJson = locatedJson ?? (tree.path ? await readJsonOrNull<PackageJson>(path.join(tree.path, "package.json")) : null)
 
     const all = packageJson ? { ...packageJson.dependencies, ...packageJson.optionalDependencies } : { ...tree.dependencies, ...tree.optionalDependencies }
     const optional = packageJson ? { ...packageJson.optionalDependencies } : {}
@@ -228,7 +228,9 @@ export class PnpmNodeModulesCollector extends NodeModulesCollector<PnpmDependenc
       if (optional[packageName]) {
         const pkg = await this.locateFromDepOrRoot(packageName, tree.path, dependency.version)
         if (!pkg) {
-          this.logMissingDependency(`${packageName}@${dependency.version}`)
+          // Declared in `optionalDependencies`, so a miss is an expected condition (e.g. fsevents
+          // on Linux/Windows) — classify it as a missing optional dependency, not PKG_NOT_ON_DISK.
+          this.logMissingDependency(`${packageName}@${dependency.version}`, true)
           return undefined
         }
       }
@@ -285,7 +287,7 @@ export class PnpmNodeModulesCollector extends NodeModulesCollector<PnpmDependenc
   }
 
   private async readPackageJsonAt(dir: string): Promise<Package | null> {
-    const packageJson = (await _fsExtra.readJson(path.join(dir, "package.json")).catch(() => null)) as PackageJson | null
+    const packageJson = await readJsonOrNull<PackageJson>(path.join(dir, "package.json"))
     return packageJson ? { packageDir: dir, packageJson } : null
   }
 
@@ -359,7 +361,7 @@ export class PnpmNodeModulesCollector extends NodeModulesCollector<PnpmDependenc
    * transitive deps end up in allDependencies.
    */
   private async collectOmittedLinkPackages(): Promise<void> {
-    const appPkgJson = (await _fsExtra.readJson(path.join(this.rootDir, "package.json")).catch(() => null)) as PackageJson | null
+    const appPkgJson = await readJsonOrNull<PackageJson>(path.join(this.rootDir, "package.json"))
     if (!appPkgJson) {
       return
     }
@@ -373,7 +375,7 @@ export class PnpmNodeModulesCollector extends NodeModulesCollector<PnpmDependenc
       // node_modules and silently fail on (readJson returns null via .catch).
       const linkRelPath = version.slice("link:".length)
       const linkTarget = path.isAbsolute(linkRelPath) ? linkRelPath : path.resolve(this.rootDir, linkRelPath)
-      const directPkg = (await _fsExtra.readJson(path.join(linkTarget, "package.json")).catch(() => null)) as PackageJson | null
+      const directPkg = await readJsonOrNull<PackageJson>(path.join(linkTarget, "package.json"))
       const resolved = directPkg ? { packageDir: linkTarget, packageJson: directPkg } : await this.locateFromDepOrRoot(name, this.rootDir, undefined)
       if (!resolved) {
         continue

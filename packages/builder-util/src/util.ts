@@ -1,4 +1,4 @@
-import { Nullish, safeStringifyJson, isValidKey, isSensitiveFieldName, hashSensitiveValue } from "builder-util-runtime"
+import { hashSensitiveValue, isSensitiveFieldName, isValidKey, Nullish, retry, safeStringifyJson } from "builder-util-runtime"
 import chalk from "chalk"
 import { ChildProcess, execFile, ExecFileOptions, SpawnOptions } from "child_process"
 import { spawn as _spawn } from "cross-spawn"
@@ -7,9 +7,6 @@ import { dump } from "js-yaml"
 import path from "path"
 import { install as installSourceMap } from "source-map-support"
 import { debug, log } from "./log.js"
-import { exists } from "./fs.js"
-import _fsExtra from "fs-extra"
-const { mkdir } = _fsExtra
 import { isEmptyOrSpaces } from "./stringUtil.js"
 
 // Vitest install their own source-map-aware stack-trace handling. Letting
@@ -20,24 +17,24 @@ if (process.env.VITEST == null) {
   installSourceMap()
 }
 
-export { isEmptyOrSpaces, escapeForXml } from "./stringUtil.js"
-export { safeStringifyJson, retry } from "builder-util-runtime"
+export { retry, safeStringifyJson } from "builder-util-runtime"
 export { TmpDir } from "temp-file"
 export * from "./arch.js"
 export { Arch, archFromString, ArchType, defaultArchFromString, getArchCliNames, getArchSuffix, toLinuxArchString } from "./arch.js"
 export { AsyncTaskManager } from "./asyncTaskManager.js"
 export { DebugLogger } from "./DebugLogger.js"
+export * from "./envUtil.js"
+export { parseValidEnvVarUrl } from "./envUtil.js"
 export * from "./log.js"
 export { buildGotProxyAgent, httpExecutor, NodeHttpExecutor } from "./nodeHttpExecutor.js"
 export * from "./promise.js"
-export * from "./envUtil.js"
-export { parseValidEnvVarUrl } from "./envUtil.js"
+export { escapeForXml, isEmptyOrSpaces } from "./stringUtil.js"
 
 export { asArray, deepAssign, isValidKey } from "builder-util-runtime"
 export * from "./fs.js"
 
+export { decodeCscLinkBase64, loadCscLink, resolveCscLinkPath } from "./cscLink.js"
 export { generateKsuid } from "./ksuid.js"
-export { loadCscLink, decodeCscLinkBase64, resolveCscLinkPath } from "./cscLink.js"
 
 export const debug7z = _debug("electron-builder:7z")
 
@@ -49,14 +46,45 @@ export function serializeToYaml(object: any, skipInvalid = false, noRefs = false
   })
 }
 
+// Sensitive parameter stems — any of `-`, `--`, or `/` prefix is accepted for all stems.
+// `pass:` is intentionally absent; the dedicated pass: handler in removePassword covers it without double-processing.
+// `key`/`k` cover osslsigncode `-key <pkcs11-uri>` (a URI may embed `pin-value=<PIN>`) and `security … -k <password>`.
+const SENSITIVE_FLAG_STEMS = ["accessKey", "secretKey", "privateToken", "apiKey", "passphrase", "password", "secret", "token", "String", "key", "pass", "p", "k"]
+const SENSITIVE_STEM_ALT = SENSITIVE_FLAG_STEMS.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
+// Matches a standalone flag argument (e.g. `-P`, `-k`, `--password`, `/p`) whose secret *value* is the next argv element.
+const SENSITIVE_FLAG_ONLY_RE = new RegExp(`^(?:--?|/)(?:${SENSITIVE_STEM_ALT})$`, "i")
+
+/**
+ * Redacts secrets from a spawn/exec argv for logging. Redacts **per-argument**, so a secret value that
+ * contains whitespace is hashed in full instead of leaking every token after the first — which is what
+ * happens when the argv is joined into one string first (the argument boundary is lost, and the flag
+ * pattern can only capture up to the next space). Inline forms (`pass:value`, `/b … /c`) still go
+ * through {@link removePassword}.
+ */
+export function removePasswordFromArgs(args: Array<string>): string {
+  const joined = args
+    .map((arg, index) => {
+      const prev = index > 0 ? args[index - 1] : null
+      if (prev != null && SENSITIVE_FLAG_ONLY_RE.test(prev)) {
+        // `/p \\Mac\Host\...` is a Parallels UNC path passed to signtool, not a secret
+        if (prev.toLowerCase() === "/p" && arg.startsWith("\\\\Mac\\Host\\")) {
+          return arg
+        }
+        return hashSensitiveValue(arg)
+      }
+      return removePassword(arg)
+    })
+    .join(" ")
+  // `/b <cert> /c` spans separate argv elements, so redact the block on the joined string.
+  // The value is a single token (a cert thumbprint), so `\S+` — not `.*?` between two `\s+` — keeps
+  // this linear and ReDoS-safe (CodeQL: polynomial regexp on `/b ` + many spaces).
+  return joined.replace(/(\/b\s+)(\S+)(\s+\/c)/g, (_match, p1, p2, p3) => `${p1}${hashSensitiveValue(p2)}${p3}`)
+}
+
 export function removePassword(input: string): string {
-  // Sensitive parameter stems — any of `-`, `--`, or `/` prefix is accepted for all stems.
-  // `pass:` is intentionally absent; the dedicated pass: handler below covers it without double-processing.
-  const sensitiveStems = ["accessKey", "secretKey", "privateToken", "apiKey", "passphrase", "password", "secret", "token", "String", "pass", "p"]
-  const stemAlt = sensitiveStems.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
   // (?:--?|/) matches -, --, or / prefix. Longest stems listed first to minimise backtracking.
   // (?<!\S) / (?=[\s"']|$) word-boundary guards prevent matching -path, -StringLength, etc.
-  const flagPattern = new RegExp(`(?<!\\S)((?:--?|/)(?:${stemAlt}))(?=[\\s"']|$)\\s*(?:(["'])(.*?)\\2|([^\\s]+))`, "gi")
+  const flagPattern = new RegExp(`(?<!\\S)((?:--?|/)(?:${SENSITIVE_STEM_ALT}))(?=[\\s"']|$)\\s*(?:(["'])(.*?)\\2|([^\\s]+))`, "gi")
 
   input = input.replace(flagPattern, (_match, prefix, quote, quotedVal, unquotedVal) => {
     const value = quotedVal ?? unquotedVal
@@ -75,8 +103,8 @@ export function removePassword(input: string): string {
     return quote ? `pass:${quote}${hashSensitiveValue(value)}${quote}` : `pass:${hashSensitiveValue(value)}`
   })
 
-  // /b … /c block format
-  return input.replace(/(\/b\s+)(.*?)(\s+\/c)/g, (_match, p1, p2, p3) => {
+  // /b … /c block format. `\S+` (single-token value) not `.*?` between two `\s+` — ReDoS-safe.
+  return input.replace(/(\/b\s+)(\S+)(\s+\/c)/g, (_match, p1, p2, p3) => {
     return `${p1}${hashSensitiveValue(p2)}${p3}`
   })
 }
@@ -128,11 +156,22 @@ function getProcessEnv(env: Record<string, string | undefined> | Nullish): NodeJ
   return finalEnv
 }
 
+// Spurious process-launch failures seen under heavy concurrent builds on Windows: the OS fails to
+// start a freshly-extracted/copied executable (e.g. makeappx.exe from the win-codesign kit) while it
+// is still locked by AV or a peer build. These are launch failures — the process never ran — so
+// retrying is side-effect-free. A non-zero *exit* code is not a spawn failure and is never retried.
+const TRANSIENT_SPAWN_CODES = new Set(["UNKNOWN", "ETXTBSY", "EBUSY", "EAGAIN"])
+
+function isTransientSpawnError(error: any): boolean {
+  const cause = error?.cause ?? error
+  return typeof cause?.syscall === "string" && cause.syscall.startsWith("spawn") && TRANSIENT_SPAWN_CODES.has(cause.code)
+}
+
 export function exec(file: string, args?: Array<string> | null, options?: ExecFileOptions, isLogOutIfDebug = true): Promise<string> {
   if (log.isDebugEnabled) {
     const logFields: any = {
       file,
-      args: args == null ? "" : removePassword(args.join(" ")),
+      args: args == null ? "" : removePasswordFromArgs(args),
     }
     if (options != null) {
       if (options.cwd != null) {
@@ -153,50 +192,64 @@ export function exec(file: string, args?: Array<string> | null, options?: ExecFi
     log.debug(logFields, "executing")
   }
 
-  return new Promise<string>((resolve, reject) => {
-    execFile(
-      file,
-      args,
-      {
-        ...options,
-        maxBuffer: 1000 * 1024 * 1024,
-        env: getProcessEnv(options == null ? null : options.env), // codeql[js/shell-command-injection-from-environment] - env filtered via getProcessEnv/stripSensitiveEnvVars; execFile array args (no shell)
-      },
-      (error, stdout, stderr) => {
-        if (error == null) {
-          if (isLogOutIfDebug && log.isDebugEnabled) {
-            const logFields: any = {
-              file,
+  const attempt = () =>
+    new Promise<string>((resolve, reject) => {
+      execFile(
+        file,
+        args,
+        {
+          ...options,
+          maxBuffer: 1000 * 1024 * 1024,
+          env: getProcessEnv(options == null ? null : options.env), // codeql[js/shell-command-injection-from-environment] - env filtered via getProcessEnv/stripSensitiveEnvVars; execFile array args (no shell)
+        },
+        (error, stdout, stderr) => {
+          if (error == null) {
+            if (isLogOutIfDebug && log.isDebugEnabled) {
+              const logFields: any = {
+                file,
+              }
+              if (stdout.length > 0) {
+                logFields.stdout = stdout
+              }
+              if (stderr.length > 0) {
+                logFields.stderr = stderr
+              }
+
+              log.debug(logFields, "executed")
             }
-            if (stdout.length > 0) {
-              logFields.stdout = stdout
+            resolve(stdout.toString())
+          } else {
+            let message = chalk.red(removePassword(`Exit code: ${(error as any).code}. ${error.message}`))
+            if (stdout.length !== 0) {
+              if (file.endsWith("wine")) {
+                stdout = stdout.toString()
+              }
+              message += `\n${chalk.yellow(removePassword(stdout.toString()))}`
             }
-            if (stderr.length > 0) {
-              logFields.stderr = stderr
+            if (stderr.length !== 0) {
+              if (file.endsWith("wine")) {
+                stderr = stderr.toString()
+              }
+              message += `\n${chalk.red(removePassword(stderr.toString()))}`
             }
 
-            log.debug(logFields, "executed")
+            reject(new ExecError(file, (error as any).code, message, "", `${error.code || ExecError.code}`, { cause: error }))
           }
-          resolve(stdout.toString())
-        } else {
-          let message = chalk.red(removePassword(`Exit code: ${(error as any).code}. ${error.message}`))
-          if (stdout.length !== 0) {
-            if (file.endsWith("wine")) {
-              stdout = stdout.toString()
-            }
-            message += `\n${chalk.yellow(removePassword(stdout.toString()))}`
-          }
-          if (stderr.length !== 0) {
-            if (file.endsWith("wine")) {
-              stderr = stderr.toString()
-            }
-            message += `\n${chalk.red(removePassword(stderr.toString()))}`
-          }
-
-          reject(new ExecError(file, (error as any).code, message, "", `${error.code || ExecError.code}`, { cause: error }))
         }
+      )
+    })
+
+  return retry(attempt, {
+    retries: 2,
+    interval: 1000,
+    backoff: 1000,
+    shouldRetry: (error: any) => {
+      if (isTransientSpawnError(error)) {
+        log.warn({ file, code: (error?.cause ?? error)?.code }, "process failed to spawn (transient OS/AV lock), retrying")
+        return true
       }
-    )
+      return false
+    },
   })
 }
 
@@ -210,9 +263,9 @@ function logSpawn(command: string, args: Array<string>, options: SpawnOptions) {
     return
   }
 
-  const argsString = removePassword(args.join(" "))
+  const argsString = removePasswordFromArgs(args)
   const logFields: any = {
-    command: command + " " + (command === "docker" ? argsString : removePassword(argsString)),
+    command: command + " " + argsString,
   }
   if (options != null && options.cwd != null) {
     logFields.cwd = options.cwd
@@ -396,18 +449,6 @@ export function isTokenCharValid(token: string) {
   return /^[.\w/=+-]+$/.test(token)
 }
 
-export async function getUserDefinedCacheDir() {
-  let cacheEnv = process.env.ELECTRON_BUILDER_CACHE
-  if (!isEmptyOrSpaces(cacheEnv)) {
-    cacheEnv = path.resolve(cacheEnv)
-    if (!(await exists(cacheEnv))) {
-      await mkdir(cacheEnv)
-    }
-    return cacheEnv
-  }
-  return undefined
-}
-
 export function addValue<K, T>(map: Map<K, Array<T>>, key: K, value: T) {
   const list = map.get(key)
   if (list == null) {
@@ -505,6 +546,12 @@ export class InvalidConfigurationError extends Error {
   constructor(message: string, code = "ERR_ELECTRON_BUILDER_INVALID_CONFIGURATION") {
     super(message)
     ;(this as NodeJS.ErrnoException).code = code
+  }
+}
+
+export function assertVersionHasNoVPrefix(version: string): void {
+  if (version.startsWith("v")) {
+    throw new InvalidConfigurationError(`Version must not start with "v": ${version}`)
   }
 }
 

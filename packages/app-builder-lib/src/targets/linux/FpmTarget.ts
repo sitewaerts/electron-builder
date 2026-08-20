@@ -1,4 +1,4 @@
-import { Arch, asArray, exec, getArchSuffix, log, serializeToYaml, stripSensitiveEnvVars, TmpDir, toLinuxArchString, unlinkIfExists, use } from "builder-util"
+import { Arch, asArray, exec, getArchSuffix, log, stripSensitiveEnvVars, TmpDir, toLinuxArchString, unlinkIfExists, use } from "builder-util"
 import { Nullish } from "builder-util-runtime"
 
 import { objectToArgs } from "builder-util-runtime"
@@ -11,7 +11,7 @@ import * as errorMessages from "../../errorMessages.js"
 import { LinuxPackager } from "../../linuxPackager.js"
 import { DebOptions, LinuxTargetSpecificOptions } from "../../options/linuxOptions.js"
 import { ArtifactCreated } from "../../packagerApi.js"
-import { getAppUpdatePublishConfiguration } from "../../publish/PublishManager.js"
+import { getAppUpdatePublishConfiguration, writeAppUpdateYaml } from "../../publish/PublishManager.js"
 import { getFpmPath } from "../../toolsets/fpm.js"
 import { getLinuxToolsPath } from "../../toolsets/linuxToolsMac.js"
 import { computeEnv } from "../../util/bundledTool.js"
@@ -175,7 +175,7 @@ export default class FpmTarget extends Target {
       : null
     if (publishConfig != null) {
       log.info({ resourceDir: log.filePath(resourceDir) }, `adding autoupdate files for: ${target}`)
-      await outputFile(path.join(resourceDir, "app-update.yml"), serializeToYaml(publishConfig))
+      await writeAppUpdateYaml(resourceDir, publishConfig)
       // Extra file needed for auto-updater to detect installation method
       await outputFile(path.join(resourceDir, "package-type"), target)
     }
@@ -290,6 +290,16 @@ export default class FpmTarget extends Target {
 
     const env = {
       ...stripSensitiveEnvVars(process.env),
+    }
+
+    // fpm compresses the deb data.tar by piping GNU tar -J, which exports only
+    // XZ_OPT=-<level> — so xz runs single-threaded regardless of the machine,
+    // while rpm already defaults to multithreaded "xzmt" (measured on one
+    // 6.4 GiB tree in one run: deb 1059s vs rpm 171s). xz parses XZ_DEFAULTS
+    // before XZ_OPT, so -T0 multithreads the deb pack at the unchanged
+    // compression level; an operator-provided XZ_DEFAULTS wins. Fixes #10045.
+    if (target === "deb" && process.env.XZ_DEFAULTS == null) {
+      env.XZ_DEFAULTS = "-T0"
     }
 
     // rpmbuild wants directory rpm with some default config files. Even if we can use dylibbundler, path to such config files are not changed (we need to replace in the binary)
